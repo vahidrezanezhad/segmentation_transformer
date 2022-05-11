@@ -12,16 +12,21 @@ from sacred import Experiment
 import os
 from tensorflow.python.keras import backend as tensorflow_backend
 from utils import *
+import sys
 
 weight_decay = 1e-7
 mlp_head_units = [2048, 1024]
-input_shape = (224, 224, 3)#(32, 32, 3)
+input_shape = (448, 448, 3)#(32, 32, 3)
 projection_dim = 64
 num_classes = 30
 transformer_layers =1
 num_heads =4
 MERGE_AXIS=-1
 ##n_classes =2
+IMAGE_ORDERING = 'channels_last'
+bn_axis=3
+resnet50_Weights_path='./pretrained_model/resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5'
+
 
 transformer_units = [
     projection_dim * 2,
@@ -199,8 +204,217 @@ def create_vit_classifier(n_classes):
     #logits = layers.Dense(num_classes)(features)
     model = keras.Model(inputs=inputs, outputs=o)
     return model
+def one_side_pad( x ):
+    x = ZeroPadding2D((1, 1), data_format=IMAGE_ORDERING)(x)
+    if IMAGE_ORDERING == 'channels_first':
+        x = Lambda(lambda x : x[: , : , :-1 , :-1 ] )(x)
+    elif IMAGE_ORDERING == 'channels_last':
+        x = Lambda(lambda x : x[: , :-1 , :-1 , :  ] )(x)
+    return x
+
+def identity_block(input_tensor, kernel_size, filters, stage, block):
+    """The identity block is the block that has no conv layer at shortcut.
+    # Arguments
+        input_tensor: input tensor
+        kernel_size: defualt 3, the kernel size of middle conv layer at main path
+        filters: list of integers, the filterss of 3 conv layer at main path
+        stage: integer, current stage label, used for generating layer names
+        block: 'a','b'..., current block label, used for generating layer names
+    # Returns
+        Output tensor for the block.
+    """
+    filters1, filters2, filters3 = filters
+    
+    if IMAGE_ORDERING == 'channels_last':
+        bn_axis = 3
+    else:
+        bn_axis = 1
+
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    x = Conv2D(filters1, (1, 1) , data_format=IMAGE_ORDERING , name=conv_name_base + '2a')(input_tensor)
+    x = BatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(filters2, kernel_size , data_format=IMAGE_ORDERING ,
+               padding='same', name=conv_name_base + '2b')(x)
+    x = BatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(filters3 , (1, 1), data_format=IMAGE_ORDERING , name=conv_name_base + '2c')(x)
+    x = BatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
+
+    x = layers.add([x, input_tensor])
+    x = Activation('relu')(x)
+    return x
 
 
+def conv_block(input_tensor, kernel_size, filters, stage, block, strides=(2, 2)):
+    """conv_block is the block that has a conv layer at shortcut
+    # Arguments
+        input_tensor: input tensor
+        kernel_size: defualt 3, the kernel size of middle conv layer at main path
+        filters: list of integers, the filterss of 3 conv layer at main path
+        stage: integer, current stage label, used for generating layer names
+        block: 'a','b'..., current block label, used for generating layer names
+    # Returns
+        Output tensor for the block.
+    Note that from stage 3, the first conv layer at main path is with strides=(2,2)
+    And the shortcut should have strides=(2,2) as well
+    """
+    filters1, filters2, filters3 = filters
+    
+    if IMAGE_ORDERING == 'channels_last':
+        bn_axis = 3
+    else:
+        bn_axis = 1
+
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    x = Conv2D(filters1, (1, 1) , data_format=IMAGE_ORDERING  , strides=strides,
+               name=conv_name_base + '2a')(input_tensor)
+    x = BatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(filters2, kernel_size , data_format=IMAGE_ORDERING  , padding='same',
+               name=conv_name_base + '2b')(x)
+    x = BatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(filters3, (1, 1) , data_format=IMAGE_ORDERING  , name=conv_name_base + '2c')(x)
+    x = BatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
+
+    shortcut = Conv2D(filters3, (1, 1) , data_format=IMAGE_ORDERING  , strides=strides,
+                      name=conv_name_base + '1')(input_tensor)
+    shortcut = BatchNormalization(axis=bn_axis, name=bn_name_base + '1')(shortcut)
+
+    x = layers.add([x, shortcut])
+    x = Activation('relu')(x)
+    return x
+
+
+def create_vit_classifier_resnet(n_classes, pretraining=False):
+    
+    inputs = layers.Input(shape=input_shape)
+    IMAGE_ORDERING = 'channels_last'
+    bn_axis=3
+
+
+    x = ZeroPadding2D((3, 3), data_format=IMAGE_ORDERING)(inputs)
+    x = Conv2D(64, (7, 7), data_format=IMAGE_ORDERING, strides=(2, 2),kernel_regularizer=l2(weight_decay), name='conv1')(x)
+    f1 = x
+
+    x = BatchNormalization(axis=bn_axis, name='bn_conv1')(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((3, 3) , data_format=IMAGE_ORDERING , strides=(2, 2))(x)
+    
+
+    x = conv_block(x, 3, [64, 64, 256], stage=2, block='a', strides=(1, 1))
+    x = identity_block(x, 3, [64, 64, 256], stage=2, block='b')
+    x = identity_block(x, 3, [64, 64, 256], stage=2, block='c')
+    f2 = one_side_pad(x )
+
+
+    x = conv_block(x, 3, [128, 128, 512], stage=3, block='a')
+    x = identity_block(x, 3, [128, 128, 512], stage=3, block='b')
+    x = identity_block(x, 3, [128, 128, 512], stage=3, block='c')
+    x = identity_block(x, 3, [128, 128, 512], stage=3, block='d')
+    f3 = x 
+
+    x = conv_block(x, 3, [256, 256, 1024], stage=4, block='a')
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='b')
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='c')
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='d')
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='e')
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='f')
+    f4 = x 
+
+    x = conv_block(x, 3, [512, 512, 2048], stage=5, block='a')
+    x = identity_block(x, 3, [512, 512, 2048], stage=5, block='b')
+    x = identity_block(x, 3, [512, 512, 2048], stage=5, block='c')
+    f5 = x 
+    
+    if pretraining:
+        model=keras.Model( inputs , x ).load_weights(resnet50_Weights_path)
+    ##print(x.shape[2],'gada pahooo')
+    patch_size = 1
+    num_patches = x.shape[1]*x.shape[2]
+    patches = Patches(patch_size)(x)
+    # Encode patches.
+    encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
+    
+    for _ in range(transformer_layers):
+        # Layer normalization 1.
+        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+        # Create a multi-head attention layer.
+        attention_output = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=projection_dim, dropout=0.1
+        )(x1, x1)
+        # Skip connection 1.
+        x2 = layers.Add()([attention_output, encoded_patches])
+        # Layer normalization 2.
+        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
+        # MLP.
+        x3 = mlp(x3, hidden_units=transformer_units, dropout_rate=0.1)
+        # Skip connection 2.
+        encoded_patches = layers.Add()([x3, x2])
+    
+    encoded_patches = tf.reshape(encoded_patches, [-1, x.shape[1], x.shape[2], 64])
+
+    
+    v1024_2048 =  Conv2D( 1024 , (1, 1) , padding='same', data_format=IMAGE_ORDERING,kernel_regularizer=l2(weight_decay) )( encoded_patches )
+    v1024_2048 = ( BatchNormalization(axis=bn_axis))(v1024_2048)
+    v1024_2048 = Activation('relu')(v1024_2048)
+    
+    
+    o = ( UpSampling2D( (2,2), data_format=IMAGE_ORDERING))(v1024_2048)
+    o = ( concatenate([ o ,f4],axis=MERGE_AXIS )  )
+    o = ( ZeroPadding2D( (1,1), data_format=IMAGE_ORDERING))(o)
+    o = ( Conv2D(512, (3, 3), padding='valid', data_format=IMAGE_ORDERING,kernel_regularizer=l2(weight_decay)))(o)
+    o = ( BatchNormalization(axis=bn_axis))(o)
+    o = Activation('relu')(o)
+    
+    
+    o = ( UpSampling2D( (2,2), data_format=IMAGE_ORDERING))(o)
+    o = ( concatenate([ o ,f3],axis=MERGE_AXIS )  )
+    o = ( ZeroPadding2D( (1,1), data_format=IMAGE_ORDERING))(o)
+    o = ( Conv2D(256, (3, 3), padding='valid', data_format=IMAGE_ORDERING,kernel_regularizer=l2(weight_decay)))(o)
+    o = ( BatchNormalization(axis=bn_axis))(o)
+    o = Activation('relu')(o)
+    
+    
+    o = ( UpSampling2D( (2,2), data_format=IMAGE_ORDERING))(o)
+    o = ( concatenate([ o ,f2],axis=MERGE_AXIS )  )
+    o = ( ZeroPadding2D( (1,1), data_format=IMAGE_ORDERING))(o)
+    o = ( Conv2D(128, (3, 3), padding='valid', data_format=IMAGE_ORDERING,kernel_regularizer=l2(weight_decay)))(o)
+    o = ( BatchNormalization(axis=bn_axis))(o)
+    o = Activation('relu')(o)
+    
+    
+    o = ( UpSampling2D( (2,2), data_format=IMAGE_ORDERING))(o)
+    o = ( concatenate([ o ,f1],axis=MERGE_AXIS )  )
+    o = ( ZeroPadding2D( (1,1), data_format=IMAGE_ORDERING))(o)
+    o = ( Conv2D(64, (3, 3), padding='valid', data_format=IMAGE_ORDERING,kernel_regularizer=l2(weight_decay)))(o)
+    o = ( BatchNormalization(axis=bn_axis))(o)
+    o = Activation('relu')(o)
+    
+    
+    o = ( UpSampling2D( (2,2), data_format=IMAGE_ORDERING))(o)
+    o = ( concatenate([o,inputs],axis=MERGE_AXIS ) )
+    o = ( ZeroPadding2D((1,1)  , data_format=IMAGE_ORDERING ))(o)
+    o = ( Conv2D( 32 , (3, 3), padding='valid'  , data_format=IMAGE_ORDERING,kernel_regularizer=l2(weight_decay) ))(o)
+    o = ( BatchNormalization(axis=bn_axis))(o)
+    o = Activation('relu')(o)
+    
+    o =  Conv2D( n_classes , (1, 1) , padding='same', data_format=IMAGE_ORDERING,kernel_regularizer=l2(weight_decay) )( o )
+    o = ( BatchNormalization(axis=bn_axis))(o)
+    o = (Activation('softmax'))(o)
+    
+    
+    model = keras.Model(inputs=inputs, outputs=o)
+    return model
 
 
 
@@ -279,6 +493,14 @@ def run(n_classes,n_epochs,input_height,
         scaling_bluring,scaling_binarization,rotation,
         rotation_not_90,thetha,scaling_flip,continue_training,
         flip_index,dir_eval ,dir_output,pretraining,learning_rate):
+    
+    
+        
+    
+    
+    #if you want to see the model structure just uncomment model summary.
+    #model.summary()
+    #sys.exit()
     
     
     if data_is_provided:
@@ -378,7 +600,7 @@ def run(n_classes,n_epochs,input_height,
         weights=weights/float(np.sum(weights))
         
         
-    model = create_vit_classifier(n_classes)
+    model = create_vit_classifier_resnet(n_classes,pretraining)
     
     #if you want to see the model structure just uncomment model summary.
     #model.summary()
