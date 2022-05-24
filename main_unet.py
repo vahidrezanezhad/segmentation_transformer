@@ -12,14 +12,15 @@ from sacred import Experiment
 import os
 from tensorflow.python.keras import backend as tensorflow_backend
 from utils import *
+from metrics import *
 import sys
 
 weight_decay = 1e-7
 mlp_head_units = [2048, 1024]
-input_shape = (448, 448, 3)#(32, 32, 3)
+input_shape = (896, 896, 3)#(32, 32, 3)
 projection_dim = 64
 num_classes = 30
-transformer_layers =1
+transformer_layers =8
 num_heads =4
 MERGE_AXIS=-1
 ##n_classes =2
@@ -497,9 +498,9 @@ def run(n_classes,n_epochs,input_height,
     
         
     
-    
+    model = create_vit_classifier_resnet(n_classes,pretraining)
     #if you want to see the model structure just uncomment model summary.
-    #model.summary()
+    model.summary()
     #sys.exit()
     
     
